@@ -1,0 +1,82 @@
+name: Kubernetes CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Deploy and verify on kind
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLUSTER: resilience-ci
+      CTX: kind-resilience-ci
+      KIND_VERSION: v0.33.0
+      KUBECTL_VERSION: v1.37.1
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build fixture image from source
+        run: docker build -t resilience-ci-api:ci ./ci/app
+
+      - name: Install kind and kubectl
+        shell: bash
+        run: |
+          bin="$RUNNER_TEMP/k8s-bin"
+          mkdir -p "$bin"
+          curl -fsSL --retry 3 --max-time 90 -o "$bin/kind" \
+            "https://kind.sigs.k8s.io/dl/$KIND_VERSION/kind-linux-amd64"
+          base="https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64"
+          curl -fsSL --retry 3 --max-time 90 -o "$bin/kubectl" "$base/kubectl"
+          curl -fsSL --retry 3 --max-time 45 -o "$bin/kubectl.sha256" "$base/kubectl.sha256"
+          printf '%s  %s\n' "$(cat "$bin/kubectl.sha256")" "$bin/kubectl" | sha256sum --check
+          chmod +x "$bin/kind" "$bin/kubectl"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Create disposable cluster
+        run: kind create cluster --name "$CLUSTER" --wait 120s
+
+      - name: Deploy and wait for two ready replicas
+        shell: bash
+        run: |
+          kind load docker-image resilience-ci-api:ci --name "$CLUSTER"
+          kubectl --context "$CTX" apply -f ci/app.yaml
+          kubectl --context "$CTX" rollout status deployment/resilience-api --timeout=120s
+          kubectl --context "$CTX" get deployment resilience-api
+          ready="$(kubectl --context "$CTX" get deployment resilience-api -o jsonpath='{.status.readyReplicas}')"
+          test "$ready" = "2"
+          kubectl --context "$CTX" get pods -l app=resilience-api
+
+      - name: Smoke test API through Service
+        shell: bash
+        run: |
+          kubectl --context "$CTX" exec -i deployment/resilience-api -- python - <<'PY'
+          import json
+          from urllib.request import urlopen
+
+          with urlopen("http://resilience-api:8000/", timeout=10) as response:
+              payload = json.load(response)
+              print("HTTP", response.status, payload)
+              assert response.status == 200
+              assert payload == {"status": "running", "version": "ci"}
+          PY
+
+      - name: Show cluster diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          if command -v kubectl >/dev/null && kubectl config get-contexts "$CTX" -o name >/dev/null 2>&1; then
+            kubectl --context "$CTX" get pods -A -o wide || true
+            kubectl --context "$CTX" describe deployment resilience-api || true
+            kubectl --context "$CTX" logs deployment/resilience-api --all-containers=true --tail=50 || true
+          fi

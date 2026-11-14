@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resilience-api
+  labels:
+    app: resilience-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: resilience-api
+  template:
+    metadata:
+      labels:
+        app: resilience-api
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: api
+          image: resilience-ci-api:ci
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resilience-api
+spec:
+  selector:
+    app: resilience-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
