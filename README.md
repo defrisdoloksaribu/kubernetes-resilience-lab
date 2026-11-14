@@ -1,81 +1,105 @@
-# WireGuard VPN Monitoring & Secure Docker Access
+# Kubernetes Resilience Lab
 
-A local DevOps lab that connects Windows to an Ubuntu VM over WireGuard, restricts direct VMware LAN access to a Docker application, and shows real VPN statistics in a browser dashboard.
+[![Kubernetes CI](https://github.com/defrisdoloksaribu/kubernetes-resilience-lab/actions/workflows/kubernetes-ci.yml/badge.svg?branch=main)](https://github.com/defrisdoloksaribu/kubernetes-resilience-lab/actions/workflows/kubernetes-ci.yml)
 
-**What the lab demonstrated:** SSH worked through the VPN, the Docker app returned `HTTP 200 OK` through the VPN, and a direct IPv4 TCP connection to the same published port over the VMware LAN was rejected.
+A Kubernetes lab for testing Pod replacement, rolling updates, rollback after a failed readiness check, and autoscaling under HTTP load. The resilience experiments ran on Windows with Docker Desktop and a single-node kind cluster. GitHub Actions runs a separate deployment smoke test using a Python API built from this repository.
 
-![WireGuard dashboard showing an online tunnel, a fresh snapshot, one registered peer, a recent handshake, and cumulative RX and TX](screenshots/26-vpn-monitoring-dashboard.png)
+**Key result.** During a 180-second load test, the HPA scaled the API from **2 to 4 replicas** and back to **2** after the load stopped. The client recorded **26,717 successful requests and 0 failures** in that run.
 
 ## Architecture
 
 ```mermaid
-flowchart LR
-    W["Windows client"]
-    subgraph VM["Ubuntu 24.04 LTS on VMware"]
-        direction TB
-        G["WireGuard wg0"]
-        S["SSH"]
-        D["Docker app"]
-        M["Gunicorn and Flask"]
-        G -->|"TCP 22"| S
-        G -->|"TCP 8000"| D
-        G -->|"TCP 8765"| M
-    end
-    W -->|"WireGuard tunnel via UDP 51820"| G
-    W -.->|"Direct VMware LAN TCP 8000 rejected"| D
+flowchart TD
+    Client["Test client in the cluster"] -->|"HTTP on port 8000"| Service["ClusterIP Service"]
+    Service -->|"Ready endpoints"| Pods["API Pods"]
+    Deployment["Deployment"] -->|"Manages replicas"| Pods
+    Metrics["Metrics Server"] -->|"CPU metrics"| HPA["Horizontal Pod Autoscaler"]
+    HPA -->|"Adjusts replica count"| Deployment
 ```
 
-| Component | Role in the lab |
+The local Deployment starts with two replicas and checks readiness with an HTTP request to `/`. Its rolling update strategy uses `maxUnavailable: 0` and `maxSurge: 1`. For autoscaling, each API container requests `25m` CPU and has a `250m` limit. The HPA targets **50% of requested CPU**, allows **2–4 replicas**, and uses a **60-second scale-down stabilization window**.
+
+## Experiment results
+
+| Test | Observed result |
 | --- | --- |
-| Windows WireGuard client | Uses `10.66.77.2/32` and routes the server VPN address through the tunnel. |
-| Ubuntu VPN server | Uses `10.66.77.1/24` on `wg0`. The VMware endpoint is `192.168.132.165:51820/UDP`. |
-| Docker and iptables | Runs `devops-app` on published TCP port `8000`. A `DOCKER-USER` rule matches traffic from `ens33` toward `docker0` using the original destination port rather than the container IP. |
-| Flask and Gunicorn | Serves the dashboard on `10.66.77.1:8765`. Gunicorn runs as a non-root user under systemd. |
-| systemd timer and Python collector | Samples WireGuard every 30 seconds and writes a JSON snapshot. The dashboard reads it through `/api/status` every 10 seconds. |
+| Initial deployment | Both replicas became Ready. A request through the Service port-forward returned `HTTP 200`. |
+| Pod replacement | After one Pod was deleted, the Deployment created a replacement and returned to `2/2` Ready. |
+| Rolling update | The image changed from `resilience-api:v1` to `resilience-api:v2`, and Kubernetes reported a successful rollout. |
+| Failed readiness and rollback | A new Pod stayed `0/1` Ready while the two existing Pods remained Ready. After a manual rollback, the Deployment returned to `2/2`, and the Service returned `HTTP 200` with `X-App-Version: v2`. |
+| Horizontal Pod Autoscaler | Eight workers sent requests for 180 seconds. Replicas changed `2 → 3 → 4 → 3 → 2`. The client logged **26,717 successes and 0 failures**. |
+| GitHub Actions | The first recorded run passed in **53 seconds**. It verified two Ready replicas and the expected HTTP status and JSON body from the independent test API. |
 
-## How monitoring works
+The request totals apply only to the autoscaling test. The rolling update had no request-count summary. The single-node lab did not test node failure or production availability.
 
-The collector writes a read-only summary for the web app containing the tunnel status, peer count, handshake age, and cumulative received and sent bytes. It does not include WireGuard keys or peer endpoints. The dashboard marks snapshots older than 90 seconds as stale. A recent handshake indicates key exchange within the last three minutes, not that a peer is continuously online. RX and TX are totals, not current throughput.
+## Quick start with the standalone API
 
-## Verification
-
-| Check | Observed result |
-| --- | --- |
-| WireGuard handshake and ping | Windows and Ubuntu exchanged tunnel traffic. In one Windows ping test, all four packets reached the VPN server. |
-| SSH to the Ubuntu VPN IP | Windows logged in using `ssh defris@10.66.77.1`. |
-| Docker TCP access through the VPN | `10.66.77.1:8000` returned `TcpTestSucceeded : True` via the WireGuard interface. |
-| Direct Docker TCP access via VMware LAN | `192.168.132.165:8000` returned `TcpTestSucceeded : False` via VMnet8. |
-| Docker application response | `http://10.66.77.1:8000/` returned `HTTP 200 OK` and the application's JSON response. |
-| Dashboard service and browser | Gunicorn ran under systemd, `/api/health` returned `HTTP 200 OK`, and the Windows browser showed live statistics from fresh snapshots. |
-
-### Docker access comparison
-
-The same Windows client tested the same published TCP port using the VPN address and then the VMware LAN address. The interface name and TCP result show which path was used.
-
-![PowerShell showing TCP 8000 succeeds via WireGuard and fails via VMware VMnet8](screenshots/23-secure-network-access.png)
-
-### SSH through WireGuard
-
-The SSH command targets the Ubuntu VPN IP. The resulting Ubuntu session shows the `wg0` interface and its address.
-
-![Windows SSH command targeting 10.66.77.1 followed by a successful Ubuntu session](screenshots/10-secure-ssh-access.png)
-
-## Recheck in the lab
-
-Run these from **Windows PowerShell**, with the VM running and the WireGuard client active. The addresses are specific to this lab.
+Requires Docker, kind, and kubectl on `PATH`. Run from the repository root. On Windows, use PowerShell and Docker Desktop in Linux containers mode. **This test does not require the original v1 image.**
 
 ```powershell
-Test-NetConnection 10.66.77.1 -Port 8000
-Test-NetConnection 192.168.132.165 -Port 8000
-curl.exe -i --max-time 5 http://10.66.77.1:8000/
-curl.exe -i --max-time 5 http://10.66.77.1:8765/api/health
+docker build -t resilience-ci-api:ci ./ci/app
+kind create cluster --name resilience-ci --wait 120s
+kind load docker-image resilience-ci-api:ci --name resilience-ci
+kubectl --context kind-resilience-ci apply -f ci/app.yaml
+kubectl --context kind-resilience-ci rollout status deployment/resilience-api --timeout=120s
+kubectl --context kind-resilience-ci get deployment resilience-api
+kubectl --context kind-resilience-ci port-forward service/resilience-api 8080:8000
 ```
 
-## Scope
+In a second PowerShell tab, run `curl.exe -i http://127.0.0.1:8080/`. Expect `2/2` Ready in the Deployment and `HTTP 200` with `{"status":"running","version":"ci"}` from the API. Stop the port-forward with `Ctrl+C`. If you created the disposable cluster for this test, clean up with `kind delete cluster --name resilience-ci`.
 
-- The direct-access result applies to the tested **IPv4 VMware LAN path**. It does not establish that every non-VPN path is blocked.
-- The project was tested on a **local VMware lab**, not over the public internet.
-- The dashboard service is enabled for startup. Successful automatic recovery after a full reboot was not verified.
-- This repository contains the implementation summary and test evidence. Live VPN configuration and private keys are not included.
+## Original Windows lab
+
+The original `resilience-api:v1` image is **not included**. The `v2` image depends on it. If you already have `v1` in Docker Desktop, use the steps below on a local kind cluster named `resilience-lab`. Create the cluster first if it does not exist.
+
+1. **Deploy v1.** Run `kind load docker-image resilience-api:v1 --name resilience-lab`, then `kubectl --context kind-resilience-lab apply -f k8s/app.yaml`. Verify that both replicas are Ready. The manifest uses `imagePullPolicy: Never`, so the image must already be on the node.
+2. **Observe Pod replacement.** List the API Pods with `kubectl --context kind-resilience-lab get pods -l app=resilience-api`. Delete one Ready Pod in the lab and watch for a new Pod name and recovery to `2/2`.
+3. **Roll out v2.** Build and load the derived image, then update the Deployment.
+4. **Test rollback.** Record the healthy v2 revision. In the lab, point the readiness probe at a nonexistent path and observe the unready Pod. Restore the healthy revision with `kubectl rollout undo`, then verify two Ready replicas and the v2 response header. A rollout-status timeout does not undo the rollout automatically.
+5. **Observe autoscaling.** Confirm that Metrics Server works with `kubectl --context kind-resilience-lab top pods`. Set the CPU request and limit before applying the HPA. Run an in-cluster client against `http://resilience-api:8000/` and inspect the HPA events during and after the load.
+
+### Roll out v2
+
+```powershell
+$ctx = 'kind-resilience-lab'
+docker build -t resilience-api:v2 ./v2
+kind load docker-image resilience-api:v2 --name resilience-lab
+kubectl --context $ctx set image deployment/resilience-api api=resilience-api:v2
+kubectl --context $ctx rollout status deployment/resilience-api --timeout=120s
+kubectl --context $ctx rollout history deployment/resilience-api
+```
+
+### Configure and watch the HPA
+
+```powershell
+$ctx = 'kind-resilience-lab'
+kubectl --context $ctx top pods -l app=resilience-api
+kubectl --context $ctx set resources deployment/resilience-api -c api --requests=cpu=25m --limits=cpu=250m
+kubectl --context $ctx rollout status deployment/resilience-api --timeout=120s
+kubectl --context $ctx apply -f k8s/hpa.yaml
+kubectl --context $ctx get hpa resilience-api --watch
+```
+
+The [technical report](#technical-report) shows the readiness patch, rollback verification, Metrics Server troubleshooting, and load-test client. The certificate workaround documented there was limited to the local lab.
+
+## GitHub Actions
+
+The [Kubernetes CI workflow](.github/workflows/kubernetes-ci.yml) runs on pushes to `main`, pull requests targeting `main`, and manual dispatch. It builds `resilience-ci-api:ci`, creates a temporary kind cluster on a GitHub-hosted runner, applies the CI manifest, and checks for exactly two Ready replicas. It then calls the internal Service and verifies both HTTP status and JSON content.
+
+The workflow **does not** connect to the Windows cluster, rerun the rollback or HPA experiments, or deploy to production.
+
+## Repository guide
+
+| Path | Purpose |
+| --- | --- |
+| [`k8s/app.yaml`](k8s/app.yaml) | Local Deployment and ClusterIP Service. |
+| [`k8s/hpa.yaml`](k8s/hpa.yaml) | CPU-based autoscaling configuration. |
+| [`v2/Dockerfile`](v2/Dockerfile) and [`v2/resilience_v2.py`](v2/resilience_v2.py) | Image build and middleware for the v2 response header. |
+| [`ci/app.yaml`](ci/app.yaml) and [`ci/app/server.py`](ci/app/server.py) | Manifest and standalone Python API for the smoke test. |
+| [`docs/`](docs/) | Technical report and screenshots embedded in the document. |
+
+## Technical report
+
+[Implementasi dan Pengujian Ketahanan Aplikasi pada Kubernetes (.docx)](docs/Laporan_Implementasi_dan_Pengujian_Kubernetes.docx) contains the lab procedure, test results, and 20 numbered screenshots. The images are embedded in the Word document, so the README does not require a separate screenshot directory.
 
 Built and tested by **Defris Doloksaribu**.
